@@ -1,0 +1,11 @@
+INTRODUCTION
+
+This study analyzes library checkout data from the East Helena Branch of the Lewis & Clark Library, provided by the library itself. The objective is to identify patterns or trends in total daily book checkouts leading up to holidays when the branch is closed. Using this historical data, the study aims to develop a model to forecast checkout activity before holidays.
+
+The data is heavily skewed towards days more-than-five-days before a holiday, as the library observes a limited number of holidays. This imbalance presents a challenge as smaller, uneven datasets can reduce the accuracy and power of predictive models. To address this, various techniques will be explored to determine the best modeling approach for this dataset.
+
+PROBLEM & BACKGROUND
+
+Public libraries serve the community in a variety of important roles. They not only provide valuable information and resources, but also act as community hubs supporting educational development, promoting well-being, and addressing the unique needs of the populations they serve. The East Helena Branch serves a unique and evolving community. To stay aligned with its patrons’ needs, the library must continually assess both its services and the changing demands of the population it serves. 
+
+Understanding when the library experiences higher demand allows for better planning of programs and services. As community needs evolve, analyzing checkout trends helps the library track changes in demand and adjust its offerings accordingly. Identifying patterns in usage can also support more efficient staffing, improved preparation of materials, and better availability of high-demand items. Ultimately, checkouts offer a direct reflection of the community’s interests, learning goals, and needs.

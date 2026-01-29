@@ -1,0 +1,210 @@
+---
+title: "Course Project"
+author: "Becca Halford"
+date: "2024-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warnings=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+library(corrplot)
+library(tidyr)
+library(ggmosaic)
+library(car)
+```
+
+
+##### Specifications 
+
+1.	The source of the data: *I am using the Titanic data set downloaded from [this kaggle](https://www.kaggle.com/c/titanic/data).*
+
+2.	The response variable: *`Survived` (0 = died, 1 = survived)*
+
+3.	The predictive purpose of the data: *I want to predict if a person on the Titanic would survive or die during the disaster.* 
+
+4.	The predictor variables: 
+
+- `PassengerClass` (ticket class = 1,2,3)
+- `Gender` (female = 1, male = 0)
+- `Age` (age in years)
+- `NumFamily` (number of siblings/spouses aboard)
+
+5.	The evaluation metric used to determine success: *R^2^*
+
+```{r data preprocessing}
+# set seed for reproducibility
+set.seed(1)
+
+# load  data
+titanicTrain <- read.csv("train.csv")
+nrow(titanicTrain) # 891
+
+titanicTest <- read.csv("test.csv")
+nrow(titanicTest) # 418
+
+# remove unneeded columns and reformat sex variable
+titanicTrain$Gender <- ifelse(titanicTrain$Sex=="female", 1, 0) 
+titanicTrain <- subset(titanicTrain, select = -c(PassengerId, Name, Ticket, Fare, Cabin, Embarked, Sex, Parch))
+
+titanicTest$Gender <- ifelse(titanicTest$Sex=="female", 1, 0) 
+titanicTest <- subset(titanicTest, select = -c(PassengerId, Name, Ticket, Fare, Cabin, Embarked, Sex, Parch))
+
+# rename column names to be more intuitive
+colnames(titanicTrain)[which(names(titanicTrain)=="Pclass")] <- "PassengerClass"
+colnames(titanicTrain)[which(names(titanicTrain)=="SibSp")] <- "NumFamily"
+
+colnames(titanicTest)[which(names(titanicTest)=="Pclass")] <- "PassengerClass"
+colnames(titanicTest)[which(names(titanicTest)=="SibSp")] <- "NumFamily"
+
+# impute missing age values with the mean age
+titanicTrain$Age <- replace(titanicTrain$Age, is.na(titanicTrain$Age), mean(titanicTrain$Age, na.rm = TRUE))
+
+titanicTest$Age <- replace(titanicTest$Age, is.na(titanicTest$Age), mean(titanicTrain$Age, na.rm = TRUE))
+```
+
+
+```{r descriptive statistics}
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggmosaic))
+
+# calculate Tukey's Five Number Summaries, mean, and standard deviation
+titanic <- gather(titanicTrain, factor_key = TRUE)
+summaryStatistics <- titanic |> group_by(key) |>
+  summarise(SD = sd(value, na.rm=TRUE)
+            , MIN = min(value, na.rm=TRUE)
+            , Q2 = quantile(value,.25,na.rm=TRUE)
+            , MEAN = mean(value,na.rm=TRUE)
+            , Q4 = quantile(value,.75,na.rm=TRUE)
+            , MAX = max(value,na.rm=TRUE)
+            )
+kable(summaryStatistics, caption = "Descriptive Statistics")
+
+# create box plots of each numeric variable: PassengerClass, Age, NumFamily, Parch
+boxplot(titanicTrain$PassengerClass, col = "deeppink", ylab = "value", xlab = "PassengerClass")
+
+boxplot(titanicTrain$Age, col = "mediumorchid", ylab = "value", xlab = "Age")
+
+boxplot(titanicTrain$NumFamily, col = "cyan", ylab = "value", xlab = "NumFamily")
+
+# create bar plots of each binary variable: Survived, Gender
+barplot(table(titanicTrain$Survived), main = "Survived", col=brewer.pal(3, "Set2"))
+
+barplot(table(titanicTrain$Survived), main = "Gender", col=brewer.pal(3, "Set3"))
+
+# let's plot bivariate data
+plot(titanicTrain)
+
+
+# A Pearson Product-Moment Correlation Matrix
+cor(na.omit(titanicTrain))
+corrplot(cor(na.omit(titanicTrain)))
+```
+
+``` {r linear regression model}
+# for fun, let's see if Jack and Rose would survive
+jack <- data.frame(PassengerClass = 3
+         , Age = 20
+         , NumFamily = 0
+         , Gender = 0
+           )
+
+rose <- data.frame(PassengerClass = 1
+         , Age = 17
+         , NumFamily = 1
+         , Gender = 1
+           )
+# predictors and target
+y = as.matrix(titanicTrain[,1]) # target variable
+x = as.matrix(titanicTrain[,-1]) # predictor variables
+
+# linear regression model
+lm_model <- lm(formula = Survived~.
+               , data = titanicTrain)
+summary(lm_model)
+```
+
+```{r  training data evaluation}
+# make predictions on training data
+preds_train <- predict(lm_model, titanicTrain)
+
+# if the prediction is greater than .75, they survived
+result_train <- ifelse(preds_train > .75, 1, 0)
+
+finalOutput <- data.frame(titanicTrain$Survived)
+finalOutput['Predictions'] <- result_train
+
+# calculate if the prediction was correct or not
+finalOutput$Correct <- apply(finalOutput, 1, function(row) all(row==row[1]))
+head(finalOutput)
+
+# calculate accuracy
+num_correct <- nrow(finalOutput[finalOutput$Correct == TRUE,])
+total <- nrow(titanicTrain)
+accuracy <- num_correct/total
+cat("Accuracy:", accuracy)
+
+```
+
+```{r  testing data results}
+# make predictions
+preds <- predict(lm_model, titanicTest)
+jack_preds <- predict(lm_model, jack)
+rose_preds <- predict(lm_model, rose)
+
+# if the prediction is greater than .75, they survived
+result <- ifelse(preds > .75, 1, 0)
+jack_result <- ifelse(jack_preds > .75, 1, 0)
+rose_result <- ifelse(rose_preds > .75, 1, 0)
+
+# see the predictions for the testing data
+sample(result,10)
+
+# did jack and rose survive?
+cat("Jack:", jack_result)
+cat("Rose:", rose_result)
+```
+
+
+```{r plots}
+# get the required model plots
+plot(lm_model)
+
+# target vs predictor variables
+survived <- ifelse(titanicTrain$Survived ==1, "survived", "died")
+
+# survived vs age
+plot(titanicTrain$Survived~titanicTrain$Age, pch=19, col=rgb(0,0,.6,.2),
+    main="Titanic Survival by Age",ylab="Probability of Survival", xlab="Age")
+linmod=lm(Survived~Age,data=titanicTrain)
+abline(linmod, col="green", lwd=2, lty=2)
+legend(60,0.7,c("linear fit"), col=c("green"), lty=c(1))
+
+
+# survived vs class
+survivedClass <- ggplot(data = titanicTrain) + 
+  geom_mosaic(aes(x=product(survived, PassengerClass), fill=survived)) +
+  labs(x="Class", y = "", title="Survival by Class")
+suppressWarnings(print(survivedClass))
+
+# survived vs gender
+survivedGender <- ggplot(data = titanicTrain) + 
+  geom_mosaic(aes(x=product(survived, Gender), fill=survived)) +
+  labs(x="Gender", y = "", title="Survival by Gender")
+suppressWarnings(print(survivedGender))
+
+# survived vs num family
+survivedFam <- ggplot(data = titanicTrain) + 
+  geom_mosaic(aes(x=product(survived, NumFamily), fill=survived)) +
+  labs(x="NumFamily", y = "", title="Survival by NumFamily")
+suppressWarnings(print(survivedFam))
+
+#Variable inflation factor values
+
+vif_data <- vif(lm_model)
+print(vif_data)
+```

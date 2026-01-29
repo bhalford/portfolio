@@ -1,0 +1,891 @@
+---
+title: "DSCI 726: Project 6 — Prescriptive Analysis (Kindle Licenses)"
+author: "Becca Halford"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+    theme: cosmo
+  pdf_document:
+    toc: true
+    toc_depth: 3
+fontsize: 11pt
+---
+
+> **What this notebook does:** This notebook uses Linear Programming (LP) to select which Kindle books to license and how many licenses of each book to purchase. The goal is to maximize total predicted reader value (star ratings) while staying within budget and following business rules about diversity and spending.
+>
+> **What you'll get:** Tables and plots showing which books were selected, how licenses were allocated, and how the solution responds to different constraints.
+
+# 1) Parameters (edit here to try different scenarios)
+
+**What this section does:** Sets all the important numbers that control the optimization. You can change these values to see how the solution changes.
+
+```{r parameters}
+# ---- Data paths ----
+# Where to find our cleaned book data
+data_path <- "cleaned_kindle_books.xlsx"
+
+# IMPORTANT: We MUST use predictions from the Prescriptive Analysis (not just observed ratings)
+# This ensures our optimization uses the predictive model we built earlier
+predictions_file <- "726-Proj4-PredictiveAnalysis/predictive_analysis_output/tables/predicted_stars.csv"
+
+# ---- Policy parameters (business rules for our optimization) ----
+Budget <- 95000   # Total dollars we can spend on all licenses
+u_cap  <- 10      # Maximum licenses we can buy of any single book
+K_min  <- 500     # Minimum number of different titles we must select (diversity requirement)
+alpha  <- 125     # Minimum average spend per selected title (prevents choosing only cheap books)
+
+# ---- Data filtering knobs ----
+min_price <- 10           # Remove books priced below this BEFORE optimization (avoids ultra-cheap items)
+preselect_topN <- Inf     # Speed optimization: only consider top N books by value-per-dollar
+                          # Use Inf to consider all books (no limit)
+
+# ---- Sensitivity analysis settings ----
+# We'll re-solve the optimization with different cap values to see how results change
+u_grid <- c(8, 10, 12)    # Test caps of 8, 10, and 12 licenses per book
+```
+
+### What These Parameters Mean
+
+- **Budget ($95,000):** Total money available to spend on all book licenses
+- **u_cap (10):** Maximum number of copies we can license for any single book
+- **K_min (500):** Diversity requirement - we must select at least this many different titles
+- **alpha ($125):** Quality floor - on average, we must spend at least this much per selected title
+- **min_price ($10):** Ignore books cheaper than this to avoid ultra-low-quality items
+- **u_grid:** Different cap values we'll test to see how sensitive our results are
+
+# 2) Setup & helper functions
+
+**What this section does:** Loads all the R packages we need and sets up folders to save our results.
+
+```{r setup}
+# Set options for how code chunks behave
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(123)  # Makes results reproducible (same random numbers each time)
+```
+
+```{r packages}
+# If you get errors about missing packages, uncomment the line below and run it once:
+# install.packages(c("readxl","readr","dplyr","ggplot2","scales","ompr","ompr.roi","ROI","ROI.plugin.glpk","knitr","purrr"))
+
+# Data manipulation and visualization
+library(tidyverse)   # Collection of data science packages (includes dplyr, ggplot2, etc.)
+library(readxl)      # For reading Excel files
+library(readr)       # For reading CSV files
+library(ggplot2)     # For creating plots
+library(scales)      # For formatting numbers (dollar signs, commas, etc.)
+library(knitr)       # For making nice tables
+library(purrr)       # For functional programming (map functions)
+
+# Optimization packages - these work together to solve our LP
+library(ompr)                # Lets us write optimization models in clean R code
+library(ompr.roi)            # Connects ompr to optimization solvers
+library(ROI)                 # R Optimization Infrastructure (the framework)
+library(ROI.plugin.glpk)     # The actual solver we'll use (GLPK - GNU Linear Programming Kit)
+
+# Create folders to save our outputs
+out_dir   <- "prescriptive_analysis_output"
+plots_dir <- file.path(out_dir, "plots")   # Folder for PNG plot files
+tabs_dir  <- file.path(out_dir, "tables")  # Folder for CSV data tables
+
+# Create these folders if they don't exist yet
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tabs_dir,  recursive = TRUE, showWarnings = FALSE)
+
+# Helper function to save plots with consistent settings
+save_plot <- function(plot_obj, filename, width = 8, height = 6, dpi = 300) {
+  ggsave(file.path(plots_dir, filename), plot = plot_obj, 
+         width = width, height = height, dpi = dpi)
+}
+```
+
+# 3) Load & prepare data
+
+**What this section does:** 
+1. Loads our book catalog
+2. Loads predicted ratings from Project 4
+3. Filters out books that are too cheap
+4. Joins everything together so each book has its price and predicted rating
+
+```{r data-prep}
+# =========================================================================
+# STEP 1: Load the base book catalog and apply price filter
+# =========================================================================
+
+# Check if the data file exists
+if (!file.exists(data_path)) {
+  stop("Cannot find the book data file: ", normalizePath(data_path, mustWork = FALSE),
+       "\nMake sure cleaned_kindle_books.xlsx is in the working directory.")
+}
+
+# Load the Excel file
+cat("Loading book catalog from:", data_path, "\n")
+df_base <- readxl::read_xlsx(data_path)
+
+# Clean up the data
+df_base <- df_base %>%
+  # Make sure title, price, and stars are the right data types
+  mutate(
+    title = trimws(as.character(title)),      # Remove extra spaces from titles
+    price = suppressWarnings(as.numeric(price)),  # Convert price to number
+    stars = suppressWarnings(as.numeric(stars))   # Convert stars to number
+  ) %>%
+  # Remove rows with missing critical data
+  filter(!is.na(title), !is.na(price), !is.na(stars)) %>%
+  # Apply minimum price filter (removes ultra-cheap books)
+  filter(price >= min_price) %>%
+  # Keep only one row per unique title (remove duplicates)
+  distinct(title, .keep_all = TRUE)
+
+cat("After filtering (min price = $", min_price, "):", nrow(df_base), "books remain\n")
+
+# =========================================================================
+# STEP 2: Load predicted ratings from Project 4 (REQUIRED!)
+# =========================================================================
+
+# We MUST use predictions from our predictive model, not observed ratings
+# This is a critical requirement for the prescriptive analysis
+
+if (!file.exists(predictions_file)) {
+  stop("Cannot find predictions file: ", normalizePath(predictions_file, mustWork = FALSE),
+       "\n\nYou need to run Project 4 first and export the predictions.",
+       "\nThe file should contain columns: title, predicted_stars")
+}
+
+cat("Loading predictions from:", predictions_file, "\n")
+preds <- readr::read_csv(predictions_file, show_col_types = FALSE)
+
+# Clean up title column in predictions (remove extra spaces)
+preds <- preds %>%
+  mutate(title = trimws(as.character(title)))
+
+# Check if the predictions file has the column we need
+has_predicted_stars <- "predicted_stars" %in% names(preds)
+has_raw_predictions <- "predicted_stars_raw" %in% names(preds)
+
+# Make sure we have at least one version of predictions
+if (!has_predicted_stars && !has_raw_predictions) {
+  stop("The predictions file must have either 'predicted_stars' or 'predicted_stars_raw' column.",
+       "\nCheck your Project 4 export step.")
+}
+
+# If we only have raw predictions, clip them to [1, 5] range
+if (!has_predicted_stars && has_raw_predictions) {
+  cat("Found raw predictions only - clipping to [1, 5] range\n")
+  preds <- preds %>%
+    mutate(predicted_stars = pmin(pmax(predicted_stars_raw, 1), 5))
+}
+
+# =========================================================================
+# STEP 3: Join predictions to book catalog
+# =========================================================================
+
+cat("Joining predictions to book catalog...\n")
+df <- df_base %>%
+  left_join(preds %>% select(title, predicted_stars, everything()), 
+            by = "title")
+
+# Check if any books are missing predictions
+books_missing_predictions <- sum(is.na(df$predicted_stars))
+
+if (books_missing_predictions > 0) {
+  stop("ERROR: ", books_missing_predictions, " books are missing predicted ratings!",
+       "\nMake sure your Project 4 predictions cover all books in the catalog.")
+}
+
+cat("Success! All", nrow(df), "books have predicted ratings\n")
+
+# =========================================================================
+# STEP 4: Create value metric and pre-select candidates
+# =========================================================================
+
+# We'll use predicted ratings as our "value" metric (r)
+df <- df %>%
+  mutate(r = predicted_stars)  # r = value metric we want to maximize
+
+# Mark that we're using predictions (not observed ratings)
+used_prediction <- TRUE
+
+# Calculate "value per dollar" to identify high-value books
+# This helps us focus on books that give good value for their price
+df <- df %>%
+  mutate(high_value = r / (price + 1e-9))  # Add tiny number to avoid division by zero
+
+# Sort by value-per-dollar (highest first)
+df <- df %>%
+  arrange(desc(high_value))
+
+# If preselect_topN is finite, keep only top N books (speeds up optimization)
+if (is.finite(preselect_topN)) {
+  cat("Pre-selecting top", preselect_topN, "books by value-per-dollar\n")
+  df <- df %>%
+    slice_head(n = preselect_topN)
+}
+
+# =========================================================================
+# STEP 5: Build final tables for optimization
+# =========================================================================
+
+# Create a clean table with just what we need for the LP
+titles <- df %>%
+  transmute(
+    title = title,
+    r = r,        # Predicted rating (our value metric)
+    p = price     # Price per license
+  )
+
+# Create index vector and extract price/rating vectors
+I <- seq_len(nrow(titles))  # I = indices 1, 2, 3, ... for each book
+p <- titles$p               # p[i] = price of book i
+r <- titles$r               # r[i] = predicted rating of book i
+
+# Show summary
+cat("\n=== FINAL CANDIDATE SET ===\n")
+cat("Number of books:", nrow(titles), "\n")
+cat("Using predictions:", used_prediction, "\n")
+cat("Min price filter: $", min_price, "\n")
+cat("Price range: $", round(min(p), 2), " to $", round(max(p), 2), "\n")
+cat("Rating range:", round(min(r), 2), " to ", round(max(r), 2), " stars\n")
+```
+
+# 4) Feasibility sanity checks
+
+**What this section does:** Before we run the optimization, we check if the problem is even solvable with the parameters we chose. This prevents wasting time on impossible problems.
+
+```{r feasibility}
+cat("\n=== CHECKING IF PROBLEM IS FEASIBLE ===\n")
+
+# -------------------------------------------------------------------------
+# Check 1: Do we have enough candidate books?
+# -------------------------------------------------------------------------
+if (nrow(titles) < K_min) {
+  stop("INFEASIBLE: Only ", nrow(titles), " candidate books but K_min requires ", K_min,
+       "\nFix: Lower K_min, lower min_price, or increase preselect_topN")
+}
+cat("✓ Check 1 passed: ", nrow(titles), " candidates >= ", K_min, " minimum required\n")
+
+# -------------------------------------------------------------------------
+# Check 2: Is budget big enough for the spend floor?
+# -------------------------------------------------------------------------
+# The spend floor constraint says: total_spend >= alpha * num_titles_selected
+# So if we select K_min titles, we need at least alpha * K_min dollars
+minimum_budget_needed <- alpha * K_min
+
+if (Budget + 1e-9 < minimum_budget_needed) {
+  stop("INFEASIBLE: Budget ($", Budget, ") is less than alpha * K_min ($", minimum_budget_needed, ")",
+       "\nThe spend floor constraint requires spending at least $", alpha, " per selected title.",
+       "\nWith K_min=", K_min, " titles, you need at least $", minimum_budget_needed,
+       "\nFix: Increase Budget, or reduce alpha or K_min")
+}
+cat("✓ Check 2 passed: Budget ($", Budget, ") >= alpha * K_min ($", minimum_budget_needed, ")\n")
+
+# -------------------------------------------------------------------------
+# Check 3: Can we physically meet the spend floor with our book prices?
+# -------------------------------------------------------------------------
+# Even if we buy the maximum (u_cap) licenses of the K_min most expensive books,
+# can we reach alpha * K_min total spending?
+
+# Calculate maximum possible spending for top K books at cap
+spending_per_book <- u_cap * p  # For each book: max licenses × price
+top_K_spending <- sort(spending_per_book, decreasing = TRUE)  # Sort highest first
+max_possible_spend_for_K <- sum(top_K_spending[1:min(K_min, length(top_K_spending))])
+
+if (max_possible_spend_for_K + 1e-9 < minimum_budget_needed) {
+  stop("LIKELY INFEASIBLE: Even buying max licenses (", u_cap, ") of the ", K_min, " priciest books,",
+       "\nwe can only spend $", round(max_possible_spend_for_K, 2), " which is less than required $", minimum_budget_needed,
+       "\nFix: (a) Increase u_cap, (b) Lower alpha or K_min, or (c) Include more expensive books")
+}
+cat("✓ Check 3 passed: Max spending capacity for K_min books ($", round(max_possible_spend_for_K, 2), 
+    ") >= required ($", minimum_budget_needed, ")\n")
+
+cat("\n=== ALL FEASIBILITY CHECKS PASSED ===\n")
+cat("The optimization problem should have a solution!\n\n")
+```
+
+# 5) Formulate & solve the Linear Program
+
+**What this section does:** This is the heart of the analysis. We define the optimization problem (what to maximize, what constraints to follow) and then ask the GLPK solver to find the best solution.
+
+### About the Optimization Model
+
+We're building a **Linear Program (LP)** which means:
+- **Objective:** Maximize a linear combination of variables (sum of rating × licenses)
+- **Constraints:** All constraints are linear inequalities or equalities
+- **Variables:** Can be any real number (continuous), not restricted to integers
+
+### About the Solver
+
+**GLPK (GNU Linear Programming Kit)** is free, open-source software that's excellent at solving linear programs. It uses sophisticated algorithms to find the optimal solution efficiently. When we run `solve_model()`:
+1. GLPK reads our objective and constraints
+2. It uses the simplex algorithm (or interior point method) to find the best values for our decision variables
+3. It returns "success" if it found the optimal solution, or an error message if the problem is infeasible
+
+```{r solve-lp}
+# This function creates and solves the LP model
+# We make it a function so we can easily re-run it with different parameters (for sensitivity analysis)
+
+solve_lp_plan <- function(u_cap, Budget, K_min, alpha) {
+  
+  cat("Setting up optimization model with:\n")
+  cat("  - Budget: $", Budget, "\n")
+  cat("  - Per-title cap (u):", u_cap, "\n")
+  cat("  - Min titles (K):", K_min, "\n")
+  cat("  - Avg spend floor (alpha): $", alpha, "\n\n")
+  
+  # =======================================================================
+  # DEFINE THE OPTIMIZATION MODEL
+  # =======================================================================
+  
+  model_lp <- MIPModel() %>%
+    
+    # -------------------------------------------------------------------
+    # DECISION VARIABLES (what the solver will choose)
+    # -------------------------------------------------------------------
+    
+    # q[i] = number of licenses to buy for book i
+    # - Type: continuous (can be any decimal number, not just whole numbers)
+    # - Lower bound: 0 (can't buy negative licenses)
+    # - Upper bound: u_cap (can't exceed the per-title cap)
+    add_variable(q[i], i = I, type = "continuous", lb = 0, ub = u_cap) %>%
+    
+    # z[i] = selection indicator for book i (helps enforce diversity and spend floor)
+    # - Type: continuous (we use LP relaxation - allows decimals instead of forcing 0 or 1)
+    # - Lower bound: 0
+    # - Upper bound: 1
+    # - In the optimal solution, z[i] ≈ 1 if book i is selected, ≈ 0 otherwise
+    add_variable(z[i], i = I, type = "continuous", lb = 0, ub = 1) %>%
+    
+    # -------------------------------------------------------------------
+    # OBJECTIVE FUNCTION (what we want to maximize)
+    # -------------------------------------------------------------------
+    
+    # Maximize: Σ r[i] × q[i]
+    # Sum of (predicted rating × licenses) across all books
+    # This is the total "value" we want to maximize
+    set_objective(sum_expr(r[i] * q[i], i = I), "max") %>%
+    
+    # -------------------------------------------------------------------
+    # CONSTRAINTS (rules the solution must follow)
+    # -------------------------------------------------------------------
+    
+    # Constraint 1: BUDGET (≤ type)
+    # Total spending must not exceed available budget
+    # Sum of (price × licenses) ≤ Budget
+    add_constraint(sum_expr(p[i] * q[i], i = I) <= Budget) %>%
+    
+    # Constraint 2: DIVERSITY (≥ type)
+    # Must select at least K_min different titles
+    # Sum of selection indicators ≥ K_min
+    # Note: In LP relaxation, this sums continuous z values, but works well in practice
+    add_constraint(sum_expr(z[i], i = I) >= K_min) %>%
+    
+    # Constraint 3: CAP & LINK (≤ type, for each book i)
+    # Ensures q[i] doesn't exceed cap and links q[i] to z[i]
+    # If z[i] = 0, then q[i] must be 0
+    # If z[i] = 1, then q[i] can be up to u_cap
+    add_constraint(q[i] <= u_cap * z[i], i = I) %>%
+    
+    # Constraint 4: AT-LEAST-ONE (≥ type, for each book i)
+    # If a book is selected (z[i] > 0), buy at least 1 license (q[i] ≥ 1)
+    # Prevents selecting books with tiny fractional quantities
+    add_constraint(q[i] >= z[i], i = I) %>%
+    
+    # Constraint 5: SPEND FLOOR (≥ type)
+    # Average spending per selected title must be at least alpha
+    # Equivalently: total_spend ≥ alpha × number_of_selected_titles
+    # Left side: sum of (price × licenses)
+    # Right side: alpha × sum of selection indicators
+    add_constraint(sum_expr(p[i] * q[i], i = I) >= alpha * sum_expr(z[i], i = I))
+  
+  # =======================================================================
+  # SOLVE THE MODEL
+  # =======================================================================
+  
+  cat("Calling GLPK solver...\n")
+  
+  # Call the GLPK solver through the ROI interface
+  res <- solve_model(
+    model_lp, 
+    with_ROI(
+      solver = "glpk",  # Use GLPK (GNU Linear Programming Kit)
+      control = list(
+        presolve = TRUE,    # Let GLPK simplify the problem first
+        tm_limit = 600000   # Time limit: 10 minutes (in milliseconds)
+      )
+    )
+  )
+  
+  # Check if solver succeeded
+  status <- as.character(solver_status(res))
+  cat("Solver status:", status, "\n")
+  
+  if (status != "success") {
+    stop("Solver failed with status: ", status, "\nCheck constraints and parameters.")
+  }
+  
+  # =======================================================================
+  # EXTRACT SOLUTION
+  # =======================================================================
+  
+  cat("Extracting solution...\n")
+  
+  # Get optimal values of q (licenses) and z (selection indicators)
+  qi <- get_solution(res, q[i]) %>% arrange(i)
+  zi <- get_solution(res, z[i]) %>% arrange(i)
+  
+  # Combine with book information and calculate derived quantities
+  sol <- titles %>%
+    mutate(
+      q = qi$value,          # Optimal licenses for this book
+      z = zi$value,          # Selection indicator value
+      spend = p * q,         # Total dollars spent on this book
+      value = r * q          # Total value contributed by this book
+    ) %>%
+    # Keep only books with positive licenses (filter out non-selected books)
+    filter(q > 1e-9) %>%
+    # Sort by value contribution (highest first)
+    arrange(desc(value))
+  
+  # Calculate summary statistics
+  plan_summary <- tibble(
+    solver_status     = status,
+    distinct_titles   = sum(qi$value > 1e-9),       # Count of books with any licenses
+    effective_z_sum   = sum(zi$value),              # Sum of z values (LP diversity mass)
+    count_atleast_one = sum(qi$value >= 1 - 1e-9),  # Count of books with ≥1 license
+    total_licenses    = sum(qi$value),              # Total licenses across all books
+    total_spend       = sum(p * qi$value),          # Total dollars spent
+    total_value       = sum(r * qi$value),          # Total value (objective function)
+    used_prediction   = used_prediction             # Flag: did we use predictions?
+  )
+  
+  cat("Done! Selected", plan_summary$distinct_titles, "titles\n")
+  cat("Total value:", round(plan_summary$total_value, 2), "\n\n")
+  
+  # Return solution and summary
+  list(sol = sol, plan_summary = plan_summary, res = res)
+}
+
+# =======================================================================
+# RUN THE OPTIMIZATION WITH OUR MAIN PARAMETERS
+# =======================================================================
+
+cat("\n=== SOLVING OPTIMIZATION WITH MAIN PARAMETERS ===\n\n")
+
+lp_out <- solve_lp_plan(u_cap = u_cap, Budget = Budget, K_min = K_min, alpha = alpha)
+
+# Extract results
+sol <- lp_out$sol                    # Detailed solution: which books, how many licenses
+plan_summary <- lp_out$plan_summary  # Summary statistics
+
+# Display summary
+cat("\n=== SOLUTION SUMMARY ===\n")
+plan_summary %>% kable(digits = 2)
+```
+
+### What These Results Mean
+
+Let's interpret the key numbers from our solution:
+
+- **solver_status = success:** GLPK found the optimal solution (the best possible allocation)
+- **distinct_titles:** How many different books we're selecting (should be ≥ K_min)
+- **effective_z_sum:** Sum of all z values - in LP relaxation, this approximates the number of selected titles
+- **count_atleast_one:** How many books get at least 1 license
+- **total_licenses:** Total number of licenses we're buying across all books
+- **total_spend:** Total dollars spent (should be close to or equal to Budget if budget constraint is binding)
+- **total_value:** The objective function value - sum of (rating × licenses) - higher is better!
+- **used_prediction:** TRUE means we used predicted ratings from Project 4 (not observed ratings)
+
+**Validate key constraints (hard checks)**
+
+**What this section does:** Double-check that our solution actually satisfies the most critical constraints. If these checks fail, something went wrong.
+
+```{r validate}
+cat("\n=== VALIDATING SOLUTION ===\n")
+
+# Check 1: Budget constraint
+# Total spending must not exceed budget (allow tiny rounding error)
+if (plan_summary$total_spend > Budget + 1e-6) {
+  stop("ERROR: Solution violates budget constraint!",
+       "\nSpent $", plan_summary$total_spend, " but budget is $", Budget)
+}
+cat("✓ Budget constraint satisfied: $", round(plan_summary$total_spend, 2), " <= $", Budget, "\n")
+
+# Check 2: Diversity constraint
+# Sum of z values must be at least K_min (allow tiny rounding error)
+if (plan_summary$effective_z_sum < K_min - 1e-6) {
+  stop("ERROR: Solution violates diversity constraint!",
+       "\nSum of z = ", plan_summary$effective_z_sum, " but K_min requires ", K_min)
+}
+cat("✓ Diversity constraint satisfied: Σz = ", round(plan_summary$effective_z_sum, 2), 
+    " >= ", K_min, "\n")
+
+# Note about LP relaxation behavior
+if (plan_summary$count_atleast_one < K_min) {
+  cat("\nNote: Only", plan_summary$count_atleast_one, "titles have ≥1 license, which is less than K_min =", K_min,
+      "\nThis is acceptable in LP relaxation - the constraint is on Σz, not count.",
+      "\nIf you need exactly K_min titles with ≥1 license, use integer programming (MILP) instead.\n")
+}
+
+cat("\n=== VALIDATION COMPLETE ===\n")
+cat("All critical constraints are satisfied!\n\n")
+```
+
+# 6) Save tables for reproducibility
+
+**What this section does:** Saves our results to CSV files so we (or others) can reproduce the analysis later or use the data in other tools.
+
+```{r save-tables}
+cat("Saving results to CSV files...\n")
+
+# Save summary statistics
+readr::write_csv(plan_summary, file.path(tabs_dir, "plan_summary.csv"))
+cat("  ✓ Saved:", file.path(tabs_dir, "plan_summary.csv"), "\n")
+
+# Save detailed solution (all selected books with their licenses and values)
+readr::write_csv(sol, file.path(tabs_dir, "selected_titles.csv"))
+cat("  ✓ Saved:", file.path(tabs_dir, "selected_titles.csv"), "\n")
+
+cat("\nYou can open these files in Excel or any spreadsheet program.\n")
+```
+
+# 7) Visualizations (also saved to disk)
+
+**What this section does:** Creates four plots to help us understand the solution:
+1. Top 20 books by value contribution
+2. Scatter plot showing price vs rating (bubble size = licenses)
+3. Histogram of how licenses are distributed
+4. Sensitivity analysis (how does solution change with different caps?)
+
+```{r top20, fig.width=10, fig.height=8}
+cat("\n=== CREATING VISUALIZATIONS ===\n\n")
+
+# -------------------------------------------------------------------------
+# Plot 1: Top 20 books by total value contribution
+# -------------------------------------------------------------------------
+
+cat("Creating Plot 1: Top 20 titles by contribution...\n")
+
+# Get top 20 books sorted by value
+top20 <- sol %>%
+  slice_head(n = 20) %>%
+  select(title, r, p, q, spend, value)
+
+# Display as table
+cat("\nTop 20 titles:\n")
+knitr::kable(top20, digits = 3, caption = "Top 20 titles by contribution (rating × licenses)")
+
+# Create bar chart
+p_top20 <- ggplot(top20, aes(x = reorder(title, value), y = value)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 titles by contribution to objective",
+    x = NULL,  # No label needed - the titles are self-explanatory
+    y = "Predicted rating × licenses"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Display the plot
+print(p_top20)
+
+# Save to file
+save_plot(p_top20 + theme(plot.margin = margin(r = 30)), 
+          "top20_value.png", width = 10, height = 8)
+cat("  ✓ Saved: top20_value.png\n\n")
+```
+
+```{r scatter, fig.width=8, fig.height=5}
+# -------------------------------------------------------------------------
+# Plot 2: Price vs Rating scatter (bubble size = licenses)
+# -------------------------------------------------------------------------
+
+cat("Creating Plot 2: Price vs predicted rating...\n")
+
+# ENHANCED VERSION - color by licenses too
+p_scatter <- ggplot(sol, aes(x = p, y = r, size = q, color = q)) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(name = "Licenses (q)", range = c(1, 10)) +
+  scale_color_gradient(low = "lightblue", high = "darkblue", name = "Licenses (q)") +
+  labs(title = "Selected titles: price vs predicted rating",
+       x = "License price ($)", y = "Predicted stars (r)") +
+  theme_minimal(base_size = 12) +
+  guides(color = guide_legend(), size = guide_legend())
+
+# Display the plot
+print(p_scatter)
+
+# Save to file
+save_plot(p_scatter, "price_vs_rating_licenses.png", 8, 5)
+cat("  ✓ Saved: price_vs_rating_licenses.png\n\n")
+```
+
+**Interpretation of Price vs Rating Plot:**
+
+- Each bubble represents a selected book
+- **X-axis (price):** How much one license costs
+- **Y-axis (rating):** Predicted star rating
+- **Bubble size:** How many licenses we're buying of that book
+- Books in the upper-left (low price, high rating) are excellent value
+- Large bubbles show books where we're buying many licenses (probably at or near the cap)
+
+```{r hist, fig.width=9, fig.height=4}
+# -------------------------------------------------------------------------
+# Plot 3: Distribution of licenses per title
+# -------------------------------------------------------------------------
+
+cat("Creating Plot 3: License distribution histogram...\n")
+
+p_hist <- ggplot(sol, aes(x = q)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.9) +
+  labs(
+    title = "Distribution of licenses among selected titles",
+    x = "Licenses per title (q)",
+    y = "Count of titles"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Display the plot
+print(p_hist)
+
+# Save to file
+save_plot(p_hist, "licenses_distribution.png", 9, 4)
+cat("  ✓ Saved: licenses_distribution.png\n\n")
+
+# Calculate some statistics about the distribution
+share_at_cap <- mean(sol$q >= (u_cap - 1e-9))
+cat("What this histogram shows:\n")
+cat("  - If there's a big spike at q =", u_cap, ", the cap is binding for many books\n")
+cat("  - Share of titles at cap:", scales::percent(share_at_cap), "\n")
+cat("  - If most titles are at the cap, raising u would increase total value\n\n")
+```
+
+# 8) Sensitivity Analysis — total value vs per-title cap (u)
+
+**What this section does:** Tests how our results change when we adjust the per-title cap. This helps us understand:
+- Is the cap a binding constraint? (Does increasing it help?)
+- How much value could we gain by allowing more licenses per book?
+
+### Why Sensitivity Analysis Matters
+
+In optimization, **sensitivity analysis** tells us how the optimal solution responds to changes in parameters. For our problem:
+- If the line slopes **upward**, the cap is **binding** — relaxing it would improve our objective
+- If the line is **flat**, the cap is **not binding** — changing it won't help
+- The **slope** tells us the marginal benefit of increasing the cap
+
+```{r sensitivity, fig.width=8, fig.height=5}
+cat("\n=== RUNNING SENSITIVITY ANALYSIS ===\n")
+cat("Testing caps:", paste(u_grid, collapse = ", "), "\n\n")
+
+# We'll solve the same problem multiple times with different cap values
+# and record the total value achieved with each cap
+
+# Create empty table to store results
+frontier_u <- tibble(u_cap = numeric(), total_value = numeric())
+
+# Loop through each cap value
+for (cap_value in u_grid) {
+  cat("Solving with u =", cap_value, "...\n")
+  
+  # Solve optimization with this cap
+  result <- solve_lp_plan(u_cap = cap_value, Budget = Budget, K_min = K_min, alpha = alpha)
+  
+  # Extract the total value achieved
+  value_achieved <- result$plan_summary$total_value
+  
+  # Add to results table
+  frontier_u <- bind_rows(
+    frontier_u,
+    tibble(u_cap = cap_value, total_value = value_achieved)
+  )
+  
+  cat("  → Total value:", round(value_achieved, 2), "\n\n")
+}
+
+# Display results table
+cat("=== SENSITIVITY RESULTS ===\n")
+frontier_u %>% kable(digits = 2)
+
+# Create line plot
+p_fu <- ggplot(frontier_u, aes(x = u_cap, y = total_value)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(size = 3, color = "steelblue") +
+  labs(
+    title = "Sensitivity — Total value vs per-title cap u (LP)",
+    x = "u (max licenses per title)",
+    y = "Total value (objective)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Display the plot
+print(p_fu)
+
+# Save plot and data
+save_plot(p_fu, "frontier_u_cap_LP.png", 8, 5)
+readr::write_csv(frontier_u, file.path(tabs_dir, "frontier_u_cap.csv"))
+cat("\n  ✓ Saved: frontier_u_cap_LP.png\n")
+cat("  ✓ Saved: frontier_u_cap.csv\n\n")
+
+# Calculate and interpret the slope
+if (nrow(frontier_u) >= 2) {
+  delta_value <- frontier_u$total_value[nrow(frontier_u)] - frontier_u$total_value[1]
+  delta_cap <- frontier_u$u_cap[nrow(frontier_u)] - frontier_u$u_cap[1]
+  avg_slope <- delta_value / delta_cap
+  
+  cat("=== INTERPRETATION ===\n")
+  cat("Increasing cap from", frontier_u$u_cap[1], "to", frontier_u$u_cap[nrow(frontier_u)],
+      "increases total value by", round(delta_value, 0), "\n")
+  cat("Average gain per unit increase in cap:", round(avg_slope, 0), "value units\n")
+  
+  if (avg_slope > 100) {
+    cat("\n✓ The upward slope indicates the cap is BINDING.\n")
+    cat("  Recommendation: Consider increasing the per-title cap if operationally feasible,")
+    cat("\n  as this would allow purchasing more of the highest-value books.\n")
+  } else if (avg_slope > 1) {
+    cat("\n→ The cap has some effect but is not strongly binding.\n")
+  } else {
+    cat("\n→ The cap appears to have minimal effect on results.\n")
+  }
+}
+```
+
+# 9) Results Summary and Interpretation
+
+**What this section does:** Brings everything together and explains what the numbers mean in plain business language.
+
+```{r interpretation, results='asis'}
+cat("\n=== FINAL RESULTS INTERPRETATION ===\n\n")
+
+# Calculate additional statistics for interpretation
+weighted_avg_rating <- sum(sol$r * sol$q) / sum(sol$q)
+share_at_cap <- mean(sol$q >= (u_cap - 1e-9))
+avg_spend_per_title <- plan_summary$total_spend / plan_summary$distinct_titles
+
+# Print comprehensive summary
+cat("### Solution Overview\n\n")
+
+cat("**Optimization Status:** ", plan_summary$solver_status, 
+    " (GLPK found the optimal solution)\n\n", sep = "")
+
+cat("**Books Selected:**\n")
+cat("- Distinct titles with any licenses (q > 0):", plan_summary$distinct_titles, "\n")
+cat("- LP diversity mass (Σ z_i):", round(plan_summary$effective_z_sum, 2), "\n")
+cat("- Titles with ≥ 1 license:", plan_summary$count_atleast_one, "\n")
+if (plan_summary$distinct_titles >= K_min) {
+  cat("- ✓ Diversity requirement met (", K_min, " minimum)\n\n", sep = "")
+} else {
+  cat("- ⚠ Warning: Below diversity requirement!\n\n")
+}
+
+cat("**Licenses and Spending:**\n")
+cat("- Total licenses purchased:", scales::comma(round(plan_summary$total_licenses)), "\n")
+cat("- Total spending:", scales::dollar(plan_summary$total_spend), "\n")
+cat("- Budget:", scales::dollar(Budget), "\n")
+
+budget_used_pct <- 100 * plan_summary$total_spend / Budget
+if (budget_used_pct >= 99.9) {
+  cat("- ✓ Budget constraint is BINDING (spent ", round(budget_used_pct, 1), "%)\n", sep = "")
+  cat("  → We could use more money if available\n\n")
+} else {
+  cat("- Budget used: ", round(budget_used_pct, 1), "%\n", sep = "")
+  cat("  → Budget is not binding\n\n")
+}
+
+cat("**Value Achieved:**\n")
+cat("- Total value (objective):", round(plan_summary$total_value, 2), "\n")
+cat("- Weighted-average rating across all licenses:", round(weighted_avg_rating, 3), "stars\n\n")
+
+cat("**Allocation Patterns:**\n")
+cat("- Share of titles at cap (q = u):", scales::percent(share_at_cap, accuracy = 0.1), "\n")
+if (share_at_cap > 0.9) {
+  cat("  → Most titles hit the cap - cap constraint is BINDING\n")
+  cat("  → Raising the cap would likely increase total value\n")
+} else if (share_at_cap > 0.5) {
+  cat("  → Many titles hit the cap - cap has significant impact\n")
+} else {
+  cat("  → Cap is not strongly binding\n")
+}
+cat("- Average spend per selected title: ", scales::dollar(avg_spend_per_title), "\n", sep = "")
+if (avg_spend_per_title >= alpha) {
+  cat("  ✓ Meets minimum average spend requirement ($", alpha, ")\n\n", sep = "")
+} else {
+  cat("  ⚠ Below minimum average spend requirement!\n\n")
+}
+
+cat("**Key Takeaways:**\n\n")
+
+# Takeaway 1: Budget usage
+if (budget_used_pct >= 99.9) {
+  cat("1. The optimization spent the full budget, indicating the budget constraint is binding.",
+      "Additional budget would allow purchasing more high-value licenses.\n\n")
+} else {
+  cat("1. The optimization did not use the full budget, suggesting other constraints",
+      "(cap, diversity, or spend floor) are more limiting.\n\n")
+}
+
+# Takeaway 2: Cap behavior
+if (share_at_cap > 0.9) {
+  cat("2. Most selected books received the maximum allowed licenses (", u_cap, ").",
+      "The per-title cap is a major binding constraint.",
+      "Sensitivity analysis confirms that raising the cap would increase total value.\n\n", sep = "")
+} else {
+  cat("2. License allocation is distributed across the range [1,", u_cap, "],",
+      "suggesting the cap is not overly restrictive for this solution.\n\n", sep = "")
+}
+
+# Takeaway 3: Quality vs diversity tradeoff
+cat("3. The solution achieved a weighted-average rating of ", round(weighted_avg_rating, 2), 
+    " stars while selecting ", plan_summary$distinct_titles, 
+    " distinct titles (exceeding the minimum of ", K_min, "),",
+    " demonstrating a good balance between quality and diversity.\n\n", sep = "")
+
+# Takeaway 4: Recommendations
+cat("**Recommendations for Future Periods:**\n\n")
+cat("- Consider adjusting the per-title cap based on observed reader demand\n")
+cat("- Monitor actual reader satisfaction to validate the predictive model\n")
+cat("- If budget increases, re-optimize to identify additional high-value titles\n")
+cat("- Review the spend floor parameter (α) to ensure it aligns with portfolio quality goals\n")
+```
+
+# 10) Reproducibility Information
+
+**What this section does:** Saves information about the R environment (package versions, etc.) so others can reproduce these exact results.
+
+```{r repro}
+cat("\n=== SAVING REPRODUCIBILITY INFO ===\n")
+
+# Save session info (R version, package versions, etc.)
+writeLines(capture.output(sessionInfo()), 
+           file.path(out_dir, "session_info.txt"))
+
+cat("✓ Session info saved to:", file.path(out_dir, "session_info.txt"), "\n")
+
+cat("\n=== ALL DONE! ===\n")
+cat("\nYour results are saved in:", normalizePath(out_dir), "\n")
+cat("  - Tables: ", file.path(out_dir, "tables/"), "\n", sep = "")
+cat("  - Plots: ", file.path(out_dir, "plots/"), "\n", sep = "")
+cat("\nOpen the HTML output to see all visualizations and results.\n")
+```
+
+---
+
+## Summary of Files Created
+
+This analysis generated the following output files:
+
+**Tables (CSV format):**
+- `plan_summary.csv` — Summary statistics for the optimal solution
+- `selected_titles.csv` — Complete list of selected books with licenses and values
+- `frontier_u_cap.csv` — Sensitivity analysis results
+
+**Plots (PNG format):**
+- `top20_value.png` — Top 20 books by value contribution
+- `price_vs_rating_licenses.png` — Scatter plot with bubble sizes
+- `licenses_distribution.png` — Histogram of license allocation
+- `frontier_u_cap_LP.png` — Sensitivity line chart
+
+**Other:**
+- `session_info.txt` — R environment details for reproducibility
+
+All files can be found in the `prescriptive_analysis_output/` directory.
